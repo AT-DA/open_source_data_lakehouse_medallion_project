@@ -1,0 +1,299 @@
+networks:
+  lakehouse-backend:
+    name: lakehouse-backend 
+    driver: bridge
+
+volumes:
+  cloudbeaver_data:
+  postgres_metastore_data:
+  airflow_postgres_data:
+
+services:
+  # -----------------------------
+  # PostgreSQL
+  # -----------------------------
+  postgres:
+    image: postgres:13
+    container_name: postgres-metastore
+    environment:
+      POSTGRES_DB: metastore  # This will be for Hive
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: hive
+    volumes:
+      - postgres_metastore_data:/var/lib/postgresql/data
+    networks:
+      - lakehouse-backend
+    # This ensures Postgres is ready before Hive starts
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hive -d metastore"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  #create a database for airflow
+  airflow-db:
+    image: postgres:13
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+    volumes:
+      - airflow_postgres_data:/var/lib/postgresql/data
+    networks:
+      - lakehouse-backend    
+
+  # -----------------------------
+  # MinIO
+  # -----------------------------
+  minio:
+    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      # This tells Docker to save everything in a 'storage' folder in your project
+      - ./minio_storage:/data
+    networks:
+      - lakehouse-backend
+    restart: unless-stopped
+
+  # -----------------------------
+  # Hive Metastore
+  # -----------------------------
+  hive-metastore:
+    image: apache/hive:4.0.0
+    container_name: hive-metastore
+    user: root
+    depends_on:
+      - postgres
+      - minio
+    ports:
+      - "9083:9083"
+    environment:
+      SERVICE_NAME: metastore
+    volumes:
+      - ./drivers/postgresql-42.7.4.jar:/opt/hive/lib/postgresql-jdbc.jar
+      - ./drivers/hadoop-aws-3.3.4.jar:/opt/hive/lib/hadoop-aws.jar
+      - ./drivers/aws-java-sdk-bundle-1.12.262.jar:/opt/hive/lib/aws-sdk.jar
+    networks:             
+      - lakehouse-backend  
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        # Generate Config
+        cat <<EOF > /opt/hive/conf/metastore-site.xml
+        <configuration>
+          <property><name>javax.jdo.option.ConnectionURL</name><value>jdbc:postgresql://postgres:5432/metastore</value></property>
+          <property><name>javax.jdo.option.ConnectionDriverName</name><value>org.postgresql.Driver</value></property>
+          <property><name>javax.jdo.option.ConnectionUserName</name><value>hive</value></property>
+          <property><name>javax.jdo.option.ConnectionPassword</name><value>hive</value></property>
+          <property><name>fs.s3a.endpoint</name><value>http://minio:9000</value></property>
+          <property><name>fs.s3a.access.key</name><value>minio</value></property>
+          <property><name>fs.s3a.secret.key</name><value>minio123</value></property>
+          <property><name>fs.s3a.path.style.access</name><value>true</value></property>
+          <property><name>fs.s3a.impl</name><value>org.apache.hadoop.fs.s3a.S3AFileSystem</value></property>
+          <property><name>hive.metastore.warehouse.dir</name><value>s3a://warehouse/</value></property>
+          <property><name>metastore.thrift.uris</name><value>thrift://0.0.0.0:9083</value></property>
+          <property><name>metastore.create.as.acid</name><value>true</value></property>
+          <property><name>hive.metastore.warehouse.dir</name><value>s3a://warehouse/</value></property>
+        </configuration>
+        EOF
+
+        echo "Waiting for Postgres..."
+        until timeout 1s bash -c "true < /dev/tcp/postgres/5432" 2>/dev/null; do
+          sleep 2
+        done
+
+        # Initialize Schema 
+        /opt/hive/bin/schematool -dbType postgres -initSchema || echo "Schema check done."
+
+        echo "Starting Hive Metastore..."
+        /opt/hive/bin/hive --service metastore
+  # -----------------------------
+  # Trino (The Final Fixed Version)
+  # -----------------------------
+  trino:
+    image: trinodb/trino:435
+    container_name: trino
+    user: root
+    depends_on:
+      - hive-metastore
+    environment:
+      - JAVA_TOOL_OPTIONS=-Xmx2G
+    entrypoint: 
+      - /bin/bash
+      - -c
+      - |
+        mkdir -p /etc/trino/catalog
+
+        #Hive Catalog
+        cat <<EOF > /etc/trino/catalog/hive.properties
+        connector.name=hive
+        hive.metastore.uri=thrift://hive-metastore:9083
+        hive.security=allow-all
+        hive.s3.endpoint=http://minio:9000
+        hive.s3.aws-access-key=minio
+        hive.s3.aws-secret-key=minio123
+        hive.s3.path-style-access=true
+        hive.s3.ssl.enabled=false
+        hive.non-managed-table-writes-enabled=true
+        EOF
+
+        #Iceberg Catalog
+        cat <<EOF > /etc/trino/catalog/iceberg.properties
+        connector.name=iceberg
+        iceberg.catalog.type=hive_metastore
+        hive.metastore.uri=thrift://hive-metastore:9083
+        iceberg.security=allow-all
+        fs.native-s3.enabled=true
+        s3.endpoint=http://minio:9000
+        s3.aws-access-key=minio
+        s3.aws-secret-key=minio123
+        s3.path-style-access=true
+        s3.region=us-east-1
+        EOF
+
+        # Node Properties
+        cat <<EOF > /etc/trino/node.properties
+        node.environment=production
+        node.id=trino-coordinator
+        node.data-dir=/data/trino
+        EOF
+
+        # Config Properties
+        cat <<EOF > /etc/trino/config.properties
+        coordinator=true
+        node-scheduler.include-coordinator=true
+        http-server.http.port=8080
+        discovery.uri=http://localhost:8080
+        EOF
+
+        #give admin permissions
+        cat <<EOF > /etc/trino/access-control.properties
+        access-control.name=allow-all
+        EOF
+
+        # JVM Config
+        cat <<EOF > /etc/trino/jvm.config
+        -server
+        -Xmx2G
+        -XX:+UseG1GC
+        -XX:G1HeapRegionSize=32M
+        -XX:+UseGCOverheadLimit
+        -XX:+ExplicitGCInvokesConcurrent
+        -XX:+HeapDumpOnOutOfMemoryError
+        -XX:+ExitOnOutOfMemoryError
+        EOF
+
+        /usr/lib/trino/bin/launcher run --etc-dir /etc/trino
+    ports:
+      - "8082:8080"
+    networks:
+      - lakehouse-backend
+    restart: unless-stopped
+  # -----------------------------
+  # CloudBeaver (Database GUI)
+  # -----------------------------
+  cloudbeaver:
+    image: dbeaver/cloudbeaver:latest
+    container_name: cloudbeaver
+    # We remove the custom entrypoint/command to let the image use its own internal logic
+    ports:
+      - "8978:8978"
+    environment:
+      # This is the built-in way to handle permissions in CloudBeaver
+      - CLOUDBEAVER_WORKSPACE_DIR=/opt/cloudbeaver/workspace
+    volumes:
+      - cloudbeaver_data:/opt/cloudbeaver/workspace
+    networks:
+      - lakehouse-backend
+    restart: unless-stopped
+
+  # -----------------------------
+  # Airflow - INIT
+  # -----------------------------
+  airflow-init:
+    image: apache/airflow:2.8.1
+    container_name: airflow-init
+    depends_on:
+      - airflow-db
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+      _AIRFLOW_DB_UPGRADE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: "admin"
+      _AIRFLOW_WWW_USER_PASSWORD: "admin"
+    command: version
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    networks:
+      - lakehouse-backend
+
+  # -----------------------------
+  # Airflow Webserver
+  # -----------------------------
+  airflow-webserver:
+    image: apache/airflow:2.8.1
+    container_name: airflow-webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+      AIRFLOW__WEBSERVER__SECRET_KEY: dev_secret_key
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      #apache-airflow-providers-trino allows airflow to send SQL commands directly to trino
+      #dbt-trino installs the dbt adapter that allows dbt to speak Trino's language.
+      _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow-providers-trino dbt-trino==1.7.1" 
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./dbt:/opt/airflow/dbt #maps local dbt code to the container
+    command: airflow webserver
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    networks:
+      - lakehouse-backend
+    restart: unless-stopped
+
+  # -----------------------------
+  # Airflow Scheduler
+  # -----------------------------
+  airflow-scheduler:
+    image: apache/airflow:2.8.1
+    container_name: airflow-scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+      #apache-airflow-providers-trino allows airflow to send SQL commands directly to trino
+      #dbt-trino installs the dbt adapter that allows dbt to speak Trino's language.
+      _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow-providers-trino dbt-trino==1.7.1" 
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./dbt:/opt/airflow/dbt #maps local dbt code to the container
+    command: airflow scheduler
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    networks:
+      - lakehouse-backend
+    restart: unless-stopped

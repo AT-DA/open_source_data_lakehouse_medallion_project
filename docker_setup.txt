@@ -1,0 +1,70 @@
+************************************************setting up the containers********************************************
+
+1. download docker-compose.yml and place it in a directory called path_x 
+2. download the jar files versions similar to the ones in docker-compose.yml (in the volumes of hive-metastore)
+	or you can donwload them from the repository in the folder hive_metastore_drivers
+3. create a new folder in the directory path_x/drivers and place in it the jar files downloaded in the previous step
+4. make sure docker desktop is installed on your machine
+5. open docker-compose.yml using visual studio code then run the command "docker-compose up -d" in the terminal
+6. all the services should appear as running from docker hub
+7. airflow-init is the only service that should start then exit
+8. to shut down the containers, run the command "docker-compose down" in the terminal of visual studio code
+
+
+************************check integration of minio, postgres, hive, trino, cloudbeaver******************************
+
+Run the below SQL commands in cloudbeaver after creating a trino connection to cloudbeaver:
+
+-- 1. Drop the old schema attempt
+DROP SCHEMA IF EXISTS hive.test_schema CASCADE;
+
+-- 2. Create schema without a forced location (it will use s3a://warehouse/ by default)
+CREATE SCHEMA hive.test_schema;
+
+-- 3. Create the table as an ACID/Managed table
+CREATE TABLE hive.test_schema.integration_test (
+    id integer,
+    message varchar
+) 
+WITH (
+    format = 'PARQUET',
+    external_location = 's3a://warehouse/test_schema.db/integration_test'
+);
+
+-- 4. Now try the Insert
+INSERT INTO hive.test_schema.integration_test VALUES (1, 'Lakehouse is alive!');
+
+
+
+
+**********************************integrating trino with dbt then airflow****************************************
+
+First, for dbt to work, it needs a profile to know how to connect to Trino. 
+
+1. Create a folder named dbt in the same directory as docker-compose.yml.
+2. Inside the folder dbt, create the file profiles.yml with the following contents:
+my_trino_db:
+  target: dev
+  outputs:
+    dev:
+      type: trino
+      method: none
+      user: admin
+      host: trino
+      port: 8080
+      http_scheme: http
+      database: hive
+      schema: test_schema
+      threads: 1
+
+3. Inside the folder dbt, create the file dbt_project.yml with the following contents:
+
+name: 'my_test_project'
+version: '1.0.0'
+config-version: 2
+profile: 'my_trino_db' # This must match the name inside profiles.yml
+model-paths: ["models"]
+
+4. run this command in docker hub:
+	docker exec -it airflow-scheduler /bin/bash -c "cd /opt/airflow/dbt && dbt debug --profiles-dir ."
+	this should appear: Connection test: [OK connection ok]

@@ -1,0 +1,101 @@
+*********************************************************************************************************
+Stack used and its integration with the other components
+
+
+PostgreSQL: Physical metadata store 
+Provides the persistent backend database for the Hive Metastore and Airflow to store task history, table schemas, and metadata.
+Integration ---> it will be used by hive metastore and airflow (each a separate running container).
+
+MinIO: Storage Layer 
+S3-compatible object storage where the physical Parquet/Metadata files reside.
+Integration ---> it is the storage layer for both Hive/Iceberg (metadata reference) and Trino (direct data access).
+
+Hive Metastore: Metadata Catalog
+The Address Book that stores table schemas and locations for both Hive and Iceberg catalogs.
+It allows Trino to read the parquet files stored in MinIO as Hive or Iceberg tables.
+Integration ---> metastore-site.xml configures Hive to integrate with Postgres, MinIO, Trino and Iceberg.  
+				 in metastore-site.xml, the property ConnectionURL allows Hive to use Postgres.
+				 in metastore-site.xml, the property endpoint allows Hive to use MinIO as the storage layer.
+				 in metastore-site.xml, the property hive.metastore.warehouse.dir tells Hive the path it will read in MinIO.
+				 in metastore-site.xml, the property metastore.thrift.uris tells Hive to listen to any connections coming 
+					from port 9083 (the property allows Trino to connect to Hive using port 9083)
+				in metastore-site.xml, the property metastore.create.as.acid as true is just a prerequisite for Hive to handle modern table formats (iceberg).
+
+Trino: Compute Engine
+The SQL query engine that executes reads/transformations without owning the data.
+Integration ---> trino should be connected to a catalogue (since it doesn't own the data) using a connector so that it can read/write to tables.
+				 in this image, trino is configured using two connectors (Hive and Iceberg).
+				 hive.properties and iceberg.properties represent the connectors should hive or iceberg tables be used.
+				 in hive.properties, it is defined to use the hive-metastore container as the Hive tables catalogue and 
+					MinIO for direct data access.
+				 iceberg.properties is similar to hive.properties, the only addition is iceberg.catalog.type=hive_metastore
+					 which is a property for iceberg connectors that tells Trino to use Hive as its catalogue.
+					 In Iceberg, the Hive catalog acts as a pointer service. When you query a table, Trino asks the Hive Metastore 
+					 for the location of the latest .json metadata file. Once Trino has that location,
+					 it stops talking to the Metastore and reads the data directly from the storage (MinIO).
+
+Apache Iceberg: Table Format
+Built on top of parquet with features like Time Travel, Snapshots, and Schema Evolution.
+It does not have a container but it cannot exist without a metastore catalogue (Hive in our case).
+The query engine used should also support iceberg (Trino in our case).
+Integration ---> Iceberg is enabled using iceberg.properties added in the Trino section.
+
+dbt: Transformation
+Handles the T in ELT—modeling raw data into business tables using SQL.
+Integration ---> for dbt to be integrated, it needs a profile (connection) to know how to connect to Trino. 
+				 in the directory dbt/profiles.yml, the profile my_trino_db allows dbt to see Trino.
+
+
+Apache Airflow: Orchestrator
+Schedules and monitors the data pipeline DAGs.
+Integration ---> in the airflow-webserver and airflow-scheduler containers, apache-airflow-providers-trino is 
+				 added in the _PIP_ADDITIONAL_REQUIREMENTS section.
+					apache-airflow-providers-trino allows airflow to send SQL commands directly to trino
+						(allows Airflow operators to work similar to how operators work with other database engines).
+					dbt-trino installs the dbt adapter that allows dbt to speak Trino's language.
+						Why is dbt-trino installed in the airflow containers?
+						Because Airflow acts as the execution environment for dbt. Airflow is the Host for dbt.
+						Even though dbt is a separate tool, it doesn't run as a service or a server (like Trino or MinIO).
+						It is a CLI (Command Line Interface). It only exists for the few seconds it takes to run a command and then it shuts down.
+						The adapter acts as the translator that allows the dbt CLI to communicate with the Trino engine,
+						converting dbt's transformation logic into Trino-compatible SQL.
+						A separate dbt container can be used but it will complicate things. dbt-trino is sufficient for the project.
+
+CloudBeaver: Database IDE
+A web-based SQL client used to visualize the Lakehouse. It allows you to query Iceberg, and Hive tables through a user-friendly browser interface.
+Integration ---> a connection to Trino is created using the UI.
+				 Trino will use the hive metastore catalogue to access iceberg and hive tables.
+
+*********************************************************************************************************
+
+
+
+*********************************************************************************************************
+The Full End-to-End Architecture Flow:
+
+
+The Trigger (Airflow): The Airflow scheduler determines it is time to run a job. It triggers a task that executes a dbt command (like dbt run).
+	
+Airflow executes the command dbt run inside its own container.
+
+The dbt CLI looks at profiles.yml.
+
+dbt-trino opens an HTTP connection from the Airflow container to the Trino container.
+
+The Logic (dbt): dbt compiles your SQL models. It connects to Trino and sends a command: CREATE TABLE iceberg.sales.orders AS SELECT ....
+
+The Command Center (Trino): Trino receives the SQL. It checks its iceberg.properties and sees catalog.type=hive_metastore.
+
+Trino calls the Hive Metastore: "I need to create/query 'sales.orders'. Where is the metadata?"
+
+The Hive Metastore looks into the Postgres database (its brain) to find the table's schema, partition info, and the location of the latest Iceberg metadata file.
+
+The Response: The Metastore returns a path to Trino, for example: s3a://warehouse/orders/metadata/v12.metadata.json.
+
+Direct Access (MinIO): Trino bypasses the Metastore and goes directly to MinIO (Storage). It reads the JSON metadata, finds the list of required Parquet files, and pulls them into its RAM to do the math.
+
+Trino does the work, and sends a "Success" message back to dbt (in the Airflow container).
+
+Visualization (CloudBeaver): You, the user, open CloudBeaver in your browser. You connect to Trino and run SELECT * FROM iceberg.sales.orders. You see the data that dbt just finished processing.
+
+*********************************************************************************************************
