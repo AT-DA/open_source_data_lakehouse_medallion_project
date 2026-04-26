@@ -126,7 +126,7 @@ The Medallion Architecture is implemented as follows:
 └── drivers/
     ├── hadoop-aws-3.3.4.jar
     ├── postgresql-42.7.4.jar
-    └── aws-java-sdk-bundle-1.12.262.jar
+    └── aws-java-sdk-bundle-1.12.262.jar # file too large to upload
 ```
 
 ---
