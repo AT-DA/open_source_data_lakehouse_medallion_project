@@ -1,0 +1,47 @@
+# ==============================================================================
+# profiles.yml: The Connection Gateway
+# This file stores the credentials and connection logic for your warehouse.
+# ==============================================================================
+
+trino_conn:
+  # THE ACTIVE TARGET:
+  # This tells dbt which output to use by default. 
+  # When you run 'dbt run', it will look at the 'dev' configuration below.
+  target: dev 
+
+  outputs:
+    # OUTPUT 1: Development Environment
+    # Used for testing and building in a "Sandbox" schema.
+    dev:
+      type: trino
+      method: none
+      user: trino
+      host: trino
+      port: 8080
+      http_scheme: http
+      database: iceberg
+      # dbt will use this as a base, but typically prefixes it with your target
+      # creating schemas like 'dev_gold' to keep dev work separate from prod.
+      schema: dev #prefix for the schemas in dbt_project.yml. 
+      threads: 1
+
+    # OUTPUT 2: Production Environment
+    # This would be used in the final Airflow pipeline for public data.
+    # To use this, you would run: dbt run --target prod
+    prod:
+      type: trino
+      method: none
+      user: admin      # Prod often uses a more restricted/admin user
+      host: trino
+      port: 8080
+      http_scheme: http
+      database: iceberg
+      schema: prod       # This is the final "Gold" destination for dashboards
+      threads: 4         # Higher thread count for faster production processing
+
+# ==============================================================================
+# KEY EXPLANATION:
+# By having two outputs (dev and prod), you can use the SAME SQL code 
+# while ensuring that your testing data (dev) never overwrites 
+# your official dashboard data (prod).
+# ==============================================================================

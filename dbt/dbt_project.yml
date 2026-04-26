@@ -1,0 +1,63 @@
+# ==============================================================================
+# dbt_project.yml: The "Brain" of the dbt Project
+# dbt automatically detects this file to understand project-wide configurations.
+# ==============================================================================
+
+# The project name is used as a unique namespace for your models
+name: 'lakehouse_project'
+version: '1.0.0'
+config-version: 2 #Version 1 is deprecated and lacks many modern dbt features.
+
+# 1. PROFILE SELECTION
+# This MUST match the name inside your profiles.yml.
+# dbt uses this to find the Trino connection details (host, port, user).
+profile: 'trino_conn' 
+
+# 2. PATH DEFINITIONS
+# These tell dbt which folders to scan for specific logic.
+model-paths: ["models"]      # Folder where your .sql transformation files live
+test-paths: ["tests"]        # Folder for data quality tests (e.g. unique, not_null)
+seed-paths: ["seeds"]        # Folder for small, static CSV lookups
+macro-paths: ["macros"]      # Folder for reusable SQL snippets using Jinja 
+# Jinja is a dbt language that dbt transaltes to sql based on the engine used.
+# this allows decoupling between dbt and the sql engine.
+
+# 3. CLEAN TARGETS
+# Directories to be deleted when you run 'dbt clean' to clear old compiled files
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# 4. RESOURCE CONFIGURATIONS (FOLDER-LEVEL SETTINGS)
+# This section defines how dbt should treat different folders in your project.
+# Settings here are applied to all .sql files within the matching folder.
+
+# The models section ---> Without this, dbt won't know that the files in your gold folder
+# should be built as Tables in Iceberg. By default, dbt builds everything as a view,
+# which is often slower for the Gold layer.
+models:
+  lakehouse_project: # must be the same name defined at the very top of this file
+    # Settings for models/staging/
+    staging:
+      +materialized: view # dbt will create these as VIEWS in the staging schema
+      +schema: staging #If the profile in (profiles.yml) target is dev, dbt will create schemas named dev_staging
+      
+    # Settings for models/marts/
+    marts:
+      +materialized: table # dbt will create these as high-performance TABLES in the gold schema
+      +schema: gold #If the profile in (profiles.yml) target is dev, dbt will create schemas named dev_gold
+
+# ==============================================================================
+# HOW IT WORKS IN YOUR PIPELINE:
+# When Airflow runs 'dbt run', dbt reads this file to decide:
+#   1. WHICH database to talk to (via 'profile')
+#   2. WHERE the code is (via 'model-paths')
+#   3. HOW to build the table (via 'materialized')
+# ==============================================================================
+
+
+# ==============================================================================
+# When you run your Airflow task with dbt run --target dev, dbt performs a clever trick with the schema name.
+# Instead of just creating a table in iceberg.gold, it combines the Target Name + Schema Name
+# from your dbt_project.yml to keep things separate.
+# ==============================================================================
